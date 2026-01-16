@@ -39,9 +39,11 @@ class CollaborativeStormLMConfigs(LMConfigs):
 
     def init(
         self,
-        lm_type: Literal["openai", "azure", "together"],
+        lm_type: Literal["openai", "azure", "together", "ollama"],
         temperature: Optional[float] = 1.0,
         top_p: Optional[float] = 0.9,
+        api_base: Optional[str] = None,
+        model: Optional[str] = None,
     ):
         if lm_type and lm_type == "openai":
             openai_kwargs = {
@@ -136,9 +138,50 @@ class CollaborativeStormLMConfigs(LMConfigs):
                 model_type="chat",
                 **together_kwargs,
             )
+        elif lm_type and lm_type == "ollama":
+            model = model or "gpt-oss:120b"
+            if not model.startswith("ollama/"):
+                model = f"ollama/{model}"
+            base_url = api_base or os.getenv("OLLAMA_API_BASE") or "http://localhost:11434"
+            ollama_kwargs = {
+                "temperature": temperature,
+                "top_p": top_p,
+                "base_url": base_url,
+                "model_type": "chat",
+            }
+            self.question_answering_lm = LitellmModel(
+                model=model,
+                max_tokens=1000,
+                **ollama_kwargs,
+            )
+            self.discourse_manage_lm = LitellmModel(
+                model=model,
+                max_tokens=500,
+                **ollama_kwargs,
+            )
+            self.utterance_polishing_lm = LitellmModel(
+                model=model,
+                max_tokens=2000,
+                **ollama_kwargs,
+            )
+            self.warmstart_outline_gen_lm = LitellmModel(
+                model=model,
+                max_tokens=500,
+                **ollama_kwargs,
+            )
+            self.question_asking_lm = LitellmModel(
+                model=model,
+                max_tokens=300,
+                **ollama_kwargs,
+            )
+            self.knowledge_base_lm = LitellmModel(
+                model=model,
+                max_tokens=1000,
+                **ollama_kwargs,
+            )
         else:
             raise Exception(
-                "No valid OpenAI API provider is provided. Cannot use default LLM configurations."
+                "No valid API provider is provided. Choose 'openai', 'azure', 'together', or 'ollama'."
             )
 
     def set_question_answering_lm(self, model: Union[dspy.dsp.LM, dspy.dsp.HFModel]):
@@ -510,6 +553,7 @@ class CoStormRunner:
         logging_wrapper: LoggingWrapper,
         rm: Optional[dspy.Retrieve] = None,
         callback_handler: BaseCallbackHandler = None,
+        encoder: Optional[Encoder] = None,
     ):
         self.runner_argument = runner_argument
         self.lm_config = lm_config
@@ -519,7 +563,7 @@ class CoStormRunner:
             self.rm = BingSearch(k=runner_argument.retrieve_top_k)
         else:
             self.rm = rm
-        self.encoder = Encoder()
+        self.encoder = encoder if encoder is not None else Encoder()
         self.conversation_history = []
         self.warmstart_conv_archive = []
         self.knowledge_base = KnowledgeBase(
@@ -556,13 +600,14 @@ class CoStormRunner:
         # FIXME: does not use the lm_config data but naively use default setting
         lm_config = CollaborativeStormLMConfigs()
         lm_config.init(lm_type=os.getenv("OPENAI_API_TYPE"))
+        encoder = Encoder()
         costorm_runner = cls(
             lm_config=lm_config,
             runner_argument=RunnerArgument.from_dict(data["runner_argument"]),
             logging_wrapper=LoggingWrapper(lm_config),
             callback_handler=callback_handler,
+            encoder=encoder,
         )
-        costorm_runner.encoder = Encoder()
         costorm_runner.conversation_history = [
             ConversationTurn.from_dict(turn) for turn in data["conversation_history"]
         ]
@@ -638,6 +683,11 @@ class CoStormRunner:
                     allow_create_new_node=True,
                     insert_under_root=self.runner_argument.rag_only_baseline_mode,
                 )
+            if len(self.conversation_history) == 0:
+                raise RuntimeError(
+                    "Warm start failed; no conversation history was created. "
+                    "Check that the LLM is reachable and the model is available."
+                )
 
     def generate_report(self) -> str:
         """
@@ -693,6 +743,11 @@ class CoStormRunner:
                 - Inserts the new turn into the `knowledge_base`, optionally allowing the creation of new nodes or inserting under the root based on the `rag_only_baseline_mode` flag.
                 - If the turn policy specifies, it reorganizes the `knowledge_base` to maintain optimal structure and relevance.
         """
+        if not self.conversation_history:
+            raise RuntimeError(
+                "No conversation history found. Did warm_start() succeed? "
+                "Ensure the LLM is reachable and models are available."
+            )
         last_conv_turn = self.conversation_history[-1]
         cur_turn_name = f"conv turn: {len(self.conversation_history) + 1}"
         with self.logging_wrapper.log_pipeline_stage(

@@ -1,21 +1,32 @@
 """
-Co-STORM pipeline powered by GPT-4o/4o-mini and Bing search engine.
-You need to set up the following environment variables to run this script:
-    - OPENAI_API_KEY: OpenAI API key
-    - OPENAI_API_TYPE: OpenAI API type (e.g., 'openai' or 'azure')
-    - AZURE_API_BASE: Azure API base URL if using Azure API
-    - AZURE_API_VERSION: Azure API version if using Azure API
-    - BING_SEARCH_API_KEY: Biang search API key; BING_SEARCH_API_KEY: Bing Search API key, SERPER_API_KEY: Serper API key, BRAVE_API_KEY: Brave API key, or TAVILY_API_KEY: Tavily API key
+Co-STORM pipeline with support for local Ollama (default), OpenAI, or Azure models and multiple search engines.
+
+Key environment variables when needed:
+    - OPENAI_API_KEY: OpenAI API key (if --llm-provider openai)
+    - AZURE_API_KEY / AZURE_API_BASE / AZURE_API_VERSION: Azure API config (if --llm-provider azure)
+    - BING_SEARCH_API_KEY / SERPER_API_KEY / BRAVE_API_KEY / TAVILY_API_KEY / etc.: Retriever keys
+    - OLLAMA_MODELS: Optional, directory for Ollama models (defaults to --ollama-model-dir)
+    - HF_HOME: Optional, cache dir for local embedding models (defaults to --embedding-cache-dir)
 
 Output will be structured as below
 args.output_dir/
     log.json           # Log of information-seeking conversation
-    report.txt         # Final article generated
+    report.md          # Final article generated
+    instance_dump.json # Serialized run state
 """
 
 import os
+import sys
 import json
+import traceback
 from argparse import ArgumentParser
+from typing import Optional
+from pathlib import Path
+
+# Ensure repository root is on sys.path so local knowledge_storm is used even if an older package is installed.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 from knowledge_storm.collaborative_storm.engine import (
     CollaborativeStormLMConfigs,
     RunnerArgument,
@@ -24,7 +35,7 @@ from knowledge_storm.collaborative_storm.engine import (
 from knowledge_storm.collaborative_storm.modules.callback import (
     LocalConsolePrintCallBackHandler,
 )
-from knowledge_storm.lm import OpenAIModel, AzureOpenAIModel
+from knowledge_storm.lm import LitellmModel, OpenAIModel, AzureOpenAIModel
 from knowledge_storm.logging_wrapper import LoggingWrapper
 from knowledge_storm.rm import (
     YouRM,
@@ -35,64 +46,107 @@ from knowledge_storm.rm import (
     TavilySearchRM,
     SearXNG,
 )
+from knowledge_storm.encoder import Encoder
 from knowledge_storm.utils import load_api_key
 
 
+def build_base_url(url: str, port: Optional[int] = None) -> str:
+    """Normalize base URL and optionally append port."""
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = f"http://{url}"
+    url = url.rstrip("/")
+    if port and f":{port}" not in url.split("//", 1)[-1]:
+        url = f"{url}:{port}"
+    return url
+
+
 def main(args):
-    load_api_key(toml_file_path="secrets.toml")
+    load_api_key(toml_file_path=args.secrets_file)
     lm_config: CollaborativeStormLMConfigs = CollaborativeStormLMConfigs()
-    openai_kwargs = (
-        {
+    if args.llm_provider == "ollama" and args.ollama_model_dir:
+        os.environ.setdefault("OLLAMA_MODELS", args.ollama_model_dir)
+
+    if args.encoder_type == "hf_local" and args.embedding_cache_dir:
+        os.environ.setdefault("HF_HOME", args.embedding_cache_dir)
+
+    embedding_base_url = (
+        build_base_url(args.embedding_base_url, args.embedding_port)
+        if args.encoder_type == "ollama"
+        else None
+    )
+    encoder_device = None if args.embedding_device == "auto" else args.embedding_device
+    encoder = Encoder(
+        encoder_type=args.encoder_type,
+        api_base=embedding_base_url,
+        model=args.embedding_model,
+        device=encoder_device,
+        cache_dir=args.embedding_cache_dir if args.encoder_type == "hf_local" else None,
+    )
+
+    llm_provider = args.llm_provider.lower()
+    if llm_provider == "ollama":
+        llm_base_url = build_base_url(args.llm_url, args.llm_port)
+        model_name = args.llm_model
+        if not model_name.startswith("ollama/"):
+            model_name = f"ollama/{model_name}"
+        ollama_kwargs = {
+            "base_url": llm_base_url,
+            "temperature": args.llm_temperature,
+            "top_p": args.llm_top_p,
+            "model_type": "chat",
+        }
+
+        def build_lm(max_tokens: int):
+            return LitellmModel(
+                model=model_name,
+                max_tokens=max_tokens,
+                **ollama_kwargs,
+            )
+
+    elif llm_provider == "openai":
+        openai_kwargs = {
             "api_key": os.getenv("OPENAI_API_KEY"),
             "api_provider": "openai",
-            "temperature": 1.0,
-            "top_p": 0.9,
+            "temperature": args.llm_temperature,
+            "top_p": args.llm_top_p,
             "api_base": None,
         }
-        if os.getenv("OPENAI_API_TYPE") == "openai"
-        else {
+        ModelClass = OpenAIModel
+        gpt_4o_model_name = "gpt-4o"
+
+        def build_lm(max_tokens: int):
+            return ModelClass(
+                model=gpt_4o_model_name, max_tokens=max_tokens, **openai_kwargs
+            )
+
+    elif llm_provider == "azure":
+        openai_kwargs = {
             "api_key": os.getenv("AZURE_API_KEY"),
-            "temperature": 1.0,
-            "top_p": 0.9,
+            "temperature": args.llm_temperature,
+            "top_p": args.llm_top_p,
             "api_base": os.getenv("AZURE_API_BASE"),
             "api_version": os.getenv("AZURE_API_VERSION"),
         }
-    )
+        ModelClass = AzureOpenAIModel
+        gpt_4o_model_name = "gpt-4o"
 
-    ModelClass = (
-        OpenAIModel if os.getenv("OPENAI_API_TYPE") == "openai" else AzureOpenAIModel
-    )
-    # If you are using Azure service, make sure the model name matches your own deployed model name.
-    # The default name here is only used for demonstration and may not match your case.
-    gpt_4o_mini_model_name = "gpt-4o-mini"
-    gpt_4o_model_name = "gpt-4o"
-    if os.getenv("OPENAI_API_TYPE") == "azure":
-        openai_kwargs["api_base"] = os.getenv("AZURE_API_BASE")
-        openai_kwargs["api_version"] = os.getenv("AZURE_API_VERSION")
+        def build_lm(max_tokens: int):
+            return ModelClass(
+                model=gpt_4o_model_name, max_tokens=max_tokens, **openai_kwargs
+            )
+
+    else:
+        raise ValueError(
+            f'Invalid llm provider: {args.llm_provider}. Choose either "ollama", "openai", or "azure".'
+        )
 
     # STORM is a LM system so different components can be powered by different models.
-    # For a good balance between cost and quality, you can choose a cheaper/faster model for conv_simulator_lm
-    # which is used to split queries, synthesize answers in the conversation. We recommend using stronger models
-    # for outline_gen_lm which is responsible for organizing the collected information, and article_gen_lm
-    # which is responsible for generating sections with citations.
-    question_answering_lm = ModelClass(
-        model=gpt_4o_model_name, max_tokens=1000, **openai_kwargs
-    )
-    discourse_manage_lm = ModelClass(
-        model=gpt_4o_model_name, max_tokens=500, **openai_kwargs
-    )
-    utterance_polishing_lm = ModelClass(
-        model=gpt_4o_model_name, max_tokens=2000, **openai_kwargs
-    )
-    warmstart_outline_gen_lm = ModelClass(
-        model=gpt_4o_model_name, max_tokens=500, **openai_kwargs
-    )
-    question_asking_lm = ModelClass(
-        model=gpt_4o_model_name, max_tokens=300, **openai_kwargs
-    )
-    knowledge_base_lm = ModelClass(
-        model=gpt_4o_model_name, max_tokens=1000, **openai_kwargs
-    )
+    question_answering_lm = build_lm(1000)
+    discourse_manage_lm = build_lm(500)
+    utterance_polishing_lm = build_lm(2000)
+    warmstart_outline_gen_lm = build_lm(500)
+    question_asking_lm = build_lm(300)
+    knowledge_base_lm = build_lm(1000)
 
     lm_config.set_question_answering_lm(question_answering_lm)
     lm_config.set_discourse_manage_lm(discourse_manage_lm)
@@ -164,53 +218,81 @@ def main(args):
                 f'Invalid retriever: {args.retriever}. Choose either "bing", "you", "brave", "duckduckgo", "serper", "tavily", or "searxng"'
             )
 
+    os.makedirs(args.output_dir, exist_ok=True)
     costorm_runner = CoStormRunner(
         lm_config=lm_config,
         runner_argument=runner_argument,
         logging_wrapper=logging_wrapper,
         rm=rm,
+        encoder=encoder,
         callback_handler=callback_handler,
     )
 
-    # warm start the system
-    costorm_runner.warm_start()
+    article = None
+    instance_copy = None
+    log_dump = None
+    error_payload = None
+    error_exc = None
 
-    # Below is an example of how users may interact with Co-STORM to seek information together
-    # In actual deployment, we suggest allowing the user to decide whether to observe the agent utterance or inject a turn
+    try:
+        # warm start the system
+        costorm_runner.warm_start()
 
-    # observing Co-STORM LLM agent utterance for 5 turns
-    for _ in range(1):
+        # Below is an example of how users may interact with Co-STORM to seek information together
+        # In actual deployment, we suggest allowing the user to decide whether to observe the agent utterance or inject a turn
+
+        # observing Co-STORM LLM agent utterance for 5 turns
+        for _ in range(1):
+            conv_turn = costorm_runner.step()
+            print(f"**{conv_turn.role}**: {conv_turn.utterance}\n")
+
+        # active engaging by injecting your utterance
+        your_utterance = input("Your utterance: ")
+        costorm_runner.step(user_utterance=your_utterance)
+
+        # continue observing
         conv_turn = costorm_runner.step()
         print(f"**{conv_turn.role}**: {conv_turn.utterance}\n")
 
-    # active engaging by injecting your utterance
-    your_utterance = input("Your utterance: ")
-    costorm_runner.step(user_utterance=your_utterance)
+        # generate report
+        costorm_runner.knowledge_base.reorganize()
+        article = costorm_runner.generate_report()
+    except Exception as exc:
+        error_payload = {
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        print(f"Run failed: {exc}")
+        error_exc = exc
+    finally:
+        try:
+            instance_copy = costorm_runner.to_dict()
+        except Exception as e:
+            instance_copy = instance_copy or {"error": f"instance_dump_failed: {e}"}
+        try:
+            log_dump = costorm_runner.dump_logging_and_reset()
+        except Exception as e:
+            log_dump = log_dump or {"error": f"log_dump_failed: {e}"}
 
-    # continue observing
-    conv_turn = costorm_runner.step()
-    print(f"**{conv_turn.role}**: {conv_turn.utterance}\n")
+        # Save artifacts if available
+        if article is not None:
+            with open(os.path.join(args.output_dir, "report.md"), "w") as f:
+                f.write(article)
 
-    # generate report
-    costorm_runner.knowledge_base.reorganize()
-    article = costorm_runner.generate_report()
+        if instance_copy is not None:
+            with open(os.path.join(args.output_dir, "instance_dump.json"), "w") as f:
+                json.dump(instance_copy, f, indent=2)
 
-    # save results
-    os.makedirs(args.output_dir, exist_ok=True)
+        if log_dump is not None:
+            with open(os.path.join(args.output_dir, "log.json"), "w") as f:
+                json.dump(log_dump, f, indent=2)
 
-    # Save article
-    with open(os.path.join(args.output_dir, "report.md"), "w") as f:
-        f.write(article)
-
-    # Save instance dump
-    instance_copy = costorm_runner.to_dict()
-    with open(os.path.join(args.output_dir, "instance_dump.json"), "w") as f:
-        json.dump(instance_copy, f, indent=2)
-
-    # Save logging
-    log_dump = costorm_runner.dump_logging_and_reset()
-    with open(os.path.join(args.output_dir, "log.json"), "w") as f:
-        json.dump(log_dump, f, indent=2)
+        if error_payload is not None:
+            with open(os.path.join(args.output_dir, "error.json"), "w") as f:
+                json.dump(error_payload, f, indent=2)
+            # Re-raise to surface failure after saving artifacts
+            if error_exc is not None:
+                raise error_exc
 
 
 if __name__ == "__main__":
@@ -223,9 +305,96 @@ if __name__ == "__main__":
         help="Directory to store the outputs.",
     )
     parser.add_argument(
+        "--llm-provider",
+        type=str,
+        choices=["ollama", "openai", "azure"],
+        default="ollama",
+        help="LLM provider to use.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        type=str,
+        default="gpt-oss:120b",
+        help="Model name for the selected LLM provider (for Ollama, omit the 'ollama/' prefix).",
+    )
+    parser.add_argument(
+        "--llm-url",
+        type=str,
+        default="http://localhost",
+        help="Base URL for the LLM service (used for Ollama).",
+    )
+    parser.add_argument(
+        "--llm-port",
+        type=int,
+        default=11434,
+        help="Port for the LLM service (used for Ollama).",
+    )
+    parser.add_argument(
+        "--ollama-model-dir",
+        type=str,
+        default="/data/ollama/models",
+        help="Directory where Ollama should store models.",
+    )
+    parser.add_argument(
+        "--llm-temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature for the LLM.",
+    )
+    parser.add_argument(
+        "--llm-top-p",
+        type=float,
+        default=0.9,
+        help="Top-p for nucleus sampling.",
+    )
+    parser.add_argument(
+        "--encoder-type",
+        type=str,
+        choices=["hf_local", "ollama", "openai", "azure"],
+        default="hf_local",
+        help="Embedding backend to use.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        type=str,
+        default="/data/models/nvidia-llama-embed-nemotron-8b",
+        help="Embedding model name or local path.",
+    )
+    parser.add_argument(
+        "--embedding-base-url",
+        type=str,
+        default="http://localhost",
+        help="Base URL for embedding service when encoder-type is ollama.",
+    )
+    parser.add_argument(
+        "--embedding-port",
+        type=int,
+        default=11434,
+        help="Port for embedding service when encoder-type is ollama.",
+    )
+    parser.add_argument(
+        "--embedding-device",
+        type=str,
+        default="auto",
+        help="Device for local embeddings (auto, cpu, cuda).",
+    )
+    parser.add_argument(
+        "--embedding-cache-dir",
+        type=str,
+        default="/data/models",
+        help="Cache directory / HF_HOME for local embedding models.",
+    )
+    parser.add_argument(
+        "--secrets-file",
+        type=str,
+        default="/data/coscientist/secrets.toml",
+        help="Path to secrets.toml for API keys.",
+    )
+    parser.add_argument(
         "--retriever",
         type=str,
         choices=["bing", "you", "brave", "serper", "duckduckgo", "tavily", "searxng"],
+        default="duckduckgo",
         help="The search engine API to use for retrieving information.",
     )
     # hyperparameters for co-storm

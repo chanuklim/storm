@@ -64,12 +64,14 @@ class ArticleGenerationModule(dspy.Module):
     def forward(self, knowledge_base: KnowledgeBase):
         all_nodes = knowledge_base.collect_all_nodes()
         node_to_paragraph = {}
+        cited_indices: Set[int] = set()
 
         # Define a function to generate paragraphs for nodes
         def _node_generate_paragraph(node):
             node_gen_paragraph = self.gen_section(
                 topic=knowledge_base.topic, node=node, knowledge_base=knowledge_base
             )
+            cited_indices.update(node.collect_all_content())
             lines = node_gen_paragraph.split("\n")
             if lines[0].strip().replace("*", "").replace("#", "") == node.name:
                 lines = lines[1:]
@@ -104,7 +106,30 @@ class ArticleGenerationModule(dspy.Module):
         for child in knowledge_base.root.children:
             to_return.extend(helper(child, level=1))
 
-        return "\n".join(to_return)
+        article_body = "\n".join(to_return)
+
+        # Append a References section using the cited indices that appear in the generated sections.
+        reference_lines = []
+        for idx in sorted(cited_indices):
+            info = knowledge_base.info_uuid_to_info_dict.get(idx)
+            if not info:
+                continue
+            title = info.title or info.description or "Unknown source"
+            desc = info.description or ""
+            url = info.url or ""
+            line = f"[{idx}] {title}"
+            if desc:
+                line += f" — {desc}"
+            if url:
+                line += f" ({url})"
+            reference_lines.append(line)
+
+        if reference_lines:
+            article_body = f"{article_body}\n\n## References\n" + "\n".join(
+                reference_lines
+            )
+
+        return article_body
 
 
 class WriteSection(dspy.Signature):

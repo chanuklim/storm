@@ -41,10 +41,11 @@ class Encoder:
 
     The Encoder utilizes the LiteLLM library to interact with various embedding models,
     such as OpenAI and Azure embeddings. Users can specify the desired encoder type and
-    provide relevant API credentials during initialization.
+    provide relevant API credentials during initialization. It also supports loading
+    a local Hugging Face embedding model to avoid external API calls.
 
     Features:
-        - Support for multiple embedding models (e.g., OpenAI, Azure).
+        - Support for multiple embedding models (e.g., OpenAI, Azure, local HF).
         - Parallel processing for faster embedding generation.
         - Local disk caching to store and reuse embedding results.
         - Total token usage tracking for cost monitoring.
@@ -60,38 +61,86 @@ class Encoder:
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
         api_version: Optional[str] = None,
+        model: Optional[str] = None,
+        device: Optional[str] = None,
+        cache_dir: Optional[str] = None,
     ):
         """
         Initializes the Encoder with the appropriate embedding model.
 
         Args:
-            encoder_type (Optional[str]): Type of encoder ('openai', 'azure', etc.).
+            encoder_type (Optional[str]): Type of encoder ('openai', 'azure', 'ollama', 'hf_local').
             api_key (Optional[str]): API key for the encoder service.
             api_base (Optional[str]): API base URL for the encoder service.
             api_version (Optional[str]): API version for the encoder service.
+            model (Optional[str]): Embedding model identifier or local path.
+            device (Optional[str]): Device for local models (e.g., "cpu", "cuda").
+            cache_dir (Optional[str]): Cache dir for local models / HF_HOME override.
         """
         self.embedding_model_name = None
-        self.kargs = {}
+        self.kargs: Dict[str, str] = {}
         self.total_token_usage = 0
+        self.encoder_type = None
+        self.local_encoder = None
+        self.backend: Literal["litellm", "local"] = "litellm"
 
         # Initialize the appropriate embedding model
         encoder_type = encoder_type or os.getenv("ENCODER_API_TYPE")
         if not encoder_type:
             raise ValueError("ENCODER_API_TYPE environment variable is not set.")
+        self.encoder_type = encoder_type.lower()
 
-        if encoder_type.lower() == "openai":
-            self.embedding_model_name = "text-embedding-3-small"
+        if self.encoder_type == "openai":
+            self.embedding_model_name = model or "text-embedding-3-small"
             self.kargs = {"api_key": api_key or os.getenv("OPENAI_API_KEY")}
-        elif encoder_type.lower() == "azure":
-            self.embedding_model_name = "azure/text-embedding-3-small"
+        elif self.encoder_type == "azure":
+            self.embedding_model_name = model or "azure/text-embedding-3-small"
             self.kargs = {
                 "api_key": api_key or os.getenv("AZURE_API_KEY"),
                 "api_base": api_base or os.getenv("AZURE_API_BASE"),
                 "api_version": api_version or os.getenv("AZURE_API_VERSION"),
             }
+        elif self.encoder_type == "ollama":
+            model = model or os.getenv("ENCODER_MODEL_NAME") or "nomic-embed-text"
+            if not model.startswith("ollama/"):
+                model = f"ollama/{model}"
+            self.embedding_model_name = model
+            self.kargs = {
+                "base_url": api_base
+                or os.getenv("OLLAMA_API_BASE")
+                or "http://localhost:11434"
+            }
+        elif self.encoder_type == "hf_local":
+            model = model or os.getenv("ENCODER_MODEL_NAME")
+            if not model:
+                raise ValueError(
+                    "Embedding model is required for hf_local encoder. "
+                    "Set ENCODER_MODEL_NAME or pass model path/name explicitly."
+                )
+            device = self._resolve_device(device)
+            if cache_dir:
+                os.environ.setdefault("HF_HOME", cache_dir)
+            try:
+                from langchain_huggingface import HuggingFaceEmbeddings
+            except ImportError as exc:
+                raise ImportError(
+                    "langchain_huggingface is required for hf_local encoder. "
+                    "Install with `pip install langchain-huggingface`."
+                ) from exc
+
+            model_kwargs = {"device": device, "trust_remote_code": True}
+            encode_kwargs = {"normalize_embeddings": True}
+            self.local_encoder = HuggingFaceEmbeddings(
+                model_name=model,
+                model_kwargs=model_kwargs,
+                encode_kwargs=encode_kwargs,
+                cache_folder=cache_dir,
+            )
+            self.embedding_model_name = model
+            self.backend = "local"
         else:
             raise ValueError(
-                f"Unsupported ENCODER_API_TYPE '{encoder_type}'. Supported types are 'openai', 'azure', 'together'."
+                f"Unsupported ENCODER_API_TYPE '{encoder_type}'. Supported types are 'openai', 'azure', 'ollama', 'hf_local'."
             )
 
     def get_total_token_usage(self, reset: bool = False) -> int:
@@ -122,6 +171,10 @@ class Encoder:
         return self._get_text_embeddings(texts, max_workers=max_workers)
 
     def _get_single_text_embedding(self, text):
+        if self.backend == "local":
+            embedding = self.local_encoder.embed_query(text)
+            return text, embedding, 0
+
         response = litellm.embedding(
             model=self.embedding_model_name, input=text, caching=True, **self.kargs
         )
@@ -152,6 +205,10 @@ class Encoder:
             self.total_token_usage += tokens
             return np.array(embedding)
 
+        if self.backend == "local" and hasattr(self.local_encoder, "embed_documents"):
+            embeddings = self.local_encoder.embed_documents(texts)
+            return np.array(embeddings)
+
         embeddings = []
         total_tokens = 0
 
@@ -176,3 +233,14 @@ class Encoder:
         self.total_token_usage += total_tokens
 
         return np.array(embeddings)
+
+    @staticmethod
+    def _resolve_device(device: Optional[str]) -> str:
+        if device:
+            return device
+        try:
+            import torch
+
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            return "cpu"

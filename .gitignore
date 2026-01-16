@@ -24,4 +24,5 @@ secrets.toml
 *.log
 */assertion.log
 *results/
-.venv/
+.venv/.ipynb_checkpoints/
+**/.ipynb_checkpoints/

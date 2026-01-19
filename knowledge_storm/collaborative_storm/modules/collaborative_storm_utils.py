@@ -33,6 +33,71 @@ def extract_storm_info_snippet(info: Information, snippet_index: int) -> Informa
     return new_storm_info
 
 
+def translate_information_list(
+    infos: List[Information],
+    translator,
+    source_lang_hint: str = "",
+    target_lang: str = "en",
+) -> List[Information]:
+    """
+    Translate the snippets (and optionally description/title) of Information objects into the target language.
+    Keeps URLs, meta, and citation structure intact.
+    """
+
+    def _translate_text(text: str) -> str:
+        if not text:
+            return text
+        prompt = (
+            f"Translate the following text to {target_lang}.\n"
+            f"Source language hint: {source_lang_hint or 'auto-detect'}\n"
+            f"Text:\n{text}\n\n"
+            f"Translated ({target_lang}):"
+        )
+        out = translator(prompt)[0]
+        return out.strip()
+
+    translated_infos = []
+    for info in infos:
+        new_snippets = []
+        for snip in info.snippets:
+            new_snippets.append(_translate_text(snip))
+        new_desc = _translate_text(info.description) if info.description else info.description
+        new_title = _translate_text(info.title) if info.title else info.title
+        translated_infos.append(
+            Information(
+                url=info.url,
+                description=new_desc,
+                snippets=new_snippets,
+                title=new_title,
+                meta=info.meta,
+            )
+        )
+    return translated_infos
+
+
+def detect_language(text: str) -> str:
+    """Lightweight language detector: returns 'ko' if Hangul or Korean markers appear, else 'en'."""
+    lower = text.lower()
+    if any("\uac00" <= ch <= "\ud7a3" for ch in text):
+        return "ko"
+    if "한국어" in text or "korean" in lower or "ko/" in lower:
+        return "ko"
+    return "en"
+
+
+def translate_text(translator, text: str, target_lang: str = "en", source_lang_hint: str = "auto") -> str:
+    """Translate arbitrary text with the given translator LM."""
+    if not text:
+        return text
+    prompt = (
+        f"Translate the following text to {target_lang}. "
+        f"Source language hint: {source_lang_hint}. "
+        f"Text:\n{text}\n\nTranslated ({target_lang}):"
+    )
+    out = translator(prompt)[0]
+    return out.strip()
+
+
 def format_search_results(
     searched_results: List[Information],
     info_max_num_words: int = 1000,

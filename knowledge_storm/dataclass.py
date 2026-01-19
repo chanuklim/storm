@@ -311,6 +311,7 @@ class KnowledgeBase:
         knowledge_base_lm: Union[dspy.dsp.LM, dspy.dsp.HFModel],
         node_expansion_trigger_count: int,
         encoder: Encoder,
+        language: str = "en",
     ):
         """
         Initializes a KnowledgeBase instance.
@@ -334,6 +335,7 @@ class KnowledgeBase:
         )
 
         self.topic: str = topic
+        self.language: str = language
         self.encoder: Encoder = encoder
 
         self.information_insert_module = InsertInformationModule(
@@ -345,7 +347,7 @@ class KnowledgeBase:
             node_expansion_trigger_count=node_expansion_trigger_count,
         )
         self.article_generation_module = ArticleGenerationModule(
-            engine=knowledge_base_lm
+            engine=knowledge_base_lm, target_lang=self.language
         )
         self.gen_summary_module = KnowledgeBaseSummaryModule(engine=knowledge_base_lm)
 
@@ -365,6 +367,7 @@ class KnowledgeBase:
         }
         return {
             "topic": self.topic,
+            "language": self.language,
             "tree": self.root.to_dict(),
             "info_uuid_to_info_dict": info_uuid_to_info_dict,
             "info_hash_to_uuid_dict": self.info_hash_to_uuid_dict,
@@ -383,6 +386,7 @@ class KnowledgeBase:
             knowledge_base_lm=knowledge_base_lm,
             node_expansion_trigger_count=node_expansion_trigger_count,
             encoder=encoder,
+            language=data.get("language", "en"),
         )
         knowledge_base.root = KnowledgeNode.from_dict(data["tree"])
         knowledge_base.info_hash_to_uuid_dict = {

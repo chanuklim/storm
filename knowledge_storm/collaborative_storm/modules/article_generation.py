@@ -12,9 +12,15 @@ class ArticleGenerationModule(dspy.Module):
     def __init__(
         self,
         engine: Union[dspy.dsp.LM, dspy.dsp.HFModel],
+        target_lang: str = "en",
     ):
         super().__init__()
-        self.write_section = dspy.Predict(WriteSection)
+        self.target_lang = target_lang.lower()
+        # Choose language-specific signature so we generate in the user language instead of translating later.
+        if self.target_lang == "ko":
+            self.write_section = dspy.Predict(WriteSectionKo)
+        else:
+            self.write_section = dspy.Predict(WriteSection)
         self.engine = engine
 
     def _get_cited_information_string(
@@ -125,7 +131,7 @@ class ArticleGenerationModule(dspy.Module):
             reference_lines.append(line)
 
         if reference_lines:
-            article_body = f"{article_body}\n\n## References\n" + "\n".join(
+            article_body = f"{article_body}\n\n## 참고 문헌\n" + "\n".join(
                 reference_lines
             )
 
@@ -133,16 +139,39 @@ class ArticleGenerationModule(dspy.Module):
 
 
 class WriteSection(dspy.Signature):
-    """Write a Wikipedia section based on the collected information. You will be given the topic, the section you are writing and relevant information.
-    Each information will be provided with the raw content along with question and query lead to that information.
-    Here is the format of your writing:
-    Use [1], [2], ..., [n] in line (for example, "The capital of the United States is Washington, D.C.[1][3]."). You DO NOT need to include a References or Sources section to list the sources at the end.
+    """Write a Wikipedia-style section based on collected information.
+    Instructions:
+    - Write in English.
+    - Use inline citations [1], [2], ... (e.g., "The capital of the United States is Washington, D.C.[1][3].").
+    - Do not repeat the section name/topic, and do not write other sections.
+    - Do not include a References section; only inline citations. The pipeline will handle references separately.
     """
 
     info = dspy.InputField(prefix="The collected information:\n", format=str)
     topic = dspy.InputField(prefix="The topic of the page: ", format=str)
     section = dspy.InputField(prefix="The section you need to write: ", format=str)
     output = dspy.OutputField(
-        prefix="Write the section with proper inline citations (Start your writing. Don't include the page title, section name, or try to write other sections. Do not start the section with topic name.):\n",
+        prefix=(
+            "Write the section in English with inline citations [1], [2], ...; "
+            "start directly with the body (no section/topic repetition):\n"
+        ),
+        format=str,
+    )
+
+
+class WriteSectionKo(dspy.Signature):
+    """수집된 정보를 바탕으로 위키백과 스타일의 섹션을 한국어로 작성합니다.
+    지시사항:
+    - 반드시 한국어로 작성합니다.
+    - 본문에 인라인 인용 [1], [2], ... 형식만 사용합니다.
+    - 섹션 이름/주제는 반복하지 말고, 다른 섹션을 작성하지 않습니다.
+    - 참고 문헌 섹션은 작성하지 마세요(파이프라인에서 처리).
+    """
+
+    info = dspy.InputField(prefix="수집된 정보:\n", format=str)
+    topic = dspy.InputField(prefix="문서 주제: ", format=str)
+    section = dspy.InputField(prefix="작성해야 할 섹션: ", format=str)
+    output = dspy.OutputField(
+        prefix="섹션 본문을 한국어로, 인라인 인용 [1], [2], ...만 포함하여 바로 작성하세요:\n",
         format=str,
     )

@@ -236,6 +236,10 @@ class RunnerArgument:
     topic: str = field(
         metadata={"help": "Topic of discourse"},
     )
+    language: str = field(
+        default="en",
+        metadata={"help": "User language preference for generation (e.g., 'en' or 'ko')."},
+    )
     retrieve_top_k: int = field(
         default=10,
         metadata={"help": "retrieve top k results for each query in retriever"},
@@ -571,6 +575,7 @@ class CoStormRunner:
             knowledge_base_lm=self.lm_config.knowledge_base_lm,
             node_expansion_trigger_count=self.runner_argument.node_expansion_trigger_count,
             encoder=self.encoder,
+            language=self.runner_argument.language,
         )
         self.discourse_manager = DiscourseManager(
             lm_config=self.lm_config,
@@ -671,6 +676,7 @@ class CoStormRunner:
                         knowledge_base_lm=self.lm_config.knowledge_base_lm,
                         node_expansion_trigger_count=self.runner_argument.node_expansion_trigger_count,
                         encoder=self.encoder,
+                        language=self.runner_argument.language,
                     )
                 if self.conversation_history is None:
                     self.conversation_history = []

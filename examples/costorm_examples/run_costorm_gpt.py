@@ -35,6 +35,10 @@ from knowledge_storm.collaborative_storm.engine import (
 from knowledge_storm.collaborative_storm.modules.callback import (
     LocalConsolePrintCallBackHandler,
 )
+from knowledge_storm.collaborative_storm.modules.collaborative_storm_utils import (
+    detect_language,
+    translate_text,
+)
 from knowledge_storm.lm import LitellmModel, OpenAIModel, AzureOpenAIModel
 from knowledge_storm.logging_wrapper import LoggingWrapper
 from knowledge_storm.rm import (
@@ -58,6 +62,88 @@ def build_base_url(url: str, port: Optional[int] = None) -> str:
     if port and f":{port}" not in url.split("//", 1)[-1]:
         url = f"{url}:{port}"
     return url
+
+
+def chunked_translate_report(
+    translator_lm,
+    text: str,
+    target_lang: str = "ko",
+    source_lang_hint: str = "en",
+    max_chunk_chars: int = 2000,
+    log_path: Optional[str] = None,
+):
+    """Translate long reports in chunks to reduce context-related failures."""
+    if not text:
+        return text
+    paragraphs = text.split("\n\n")
+    # Pair headings with the following paragraph to preserve structure.
+    paired_paragraphs = []
+    skip_next = False
+    for idx, para in enumerate(paragraphs):
+        if skip_next:
+            skip_next = False
+            continue
+        if para.strip().startswith("#") and idx + 1 < len(paragraphs):
+            paired_paragraphs.append(f"{para}\n\n{paragraphs[idx + 1]}")
+            skip_next = True
+        else:
+            paired_paragraphs.append(para)
+
+    chunks = []
+    buffer = ""
+    for para in paired_paragraphs:
+        # If a single paragraph is too large, break it up by character count.
+        if len(para) > max_chunk_chars:
+            if buffer:
+                chunks.append(buffer)
+                buffer = ""
+            for i in range(0, len(para), max_chunk_chars):
+                chunks.append(para[i : i + max_chunk_chars])
+            continue
+        if len(buffer) + len(para) + 2 <= max_chunk_chars:
+            buffer = para if not buffer else f"{buffer}\n\n{para}"
+        else:
+            chunks.append(buffer)
+            buffer = para
+    if buffer:
+        chunks.append(buffer)
+
+    translated_chunks = []
+    log_entries = []
+    for idx, chunk in enumerate(chunks):
+        if not chunk.strip():
+            log_entries.append({"chunk_index": idx, "status": "skipped_empty"})
+            continue
+        prompt = (
+            f"Translate the following Markdown to {target_lang}. "
+            "Keep the Markdown structure exactly and do not add any prefixes, notes, or explanations. "
+            "Only return the translated Markdown content.\n"
+            f"Source language hint: {source_lang_hint}.\n\n"
+            f"Text:\n{chunk}\n\nTranslation:"
+        )
+        translated = translator_lm(prompt)[0].strip()
+        status = "translated"
+        if not translated:
+            translated = chunk
+            status = "fallback_original"
+        # Strip common artifacts the model might add.
+        translated = translated.replace("Translated (ko):", "").strip()
+        translated_chunks.append(translated)
+        log_entries.append(
+            {
+                "chunk_index": idx,
+                "input_chars": len(chunk),
+                "output_chars": len(translated),
+                "status": status,
+            }
+        )
+    if log_path:
+        try:
+            with open(log_path, "w") as lf:
+                json.dump(log_entries, lf, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    return "\n\n".join(translated_chunks)
 
 
 def main(args):
@@ -148,6 +234,9 @@ def main(args):
     question_asking_lm = build_lm(300)
     knowledge_base_lm = build_lm(1000)
 
+    # Use a separate translator model so user-facing translations don't pollute LM history
+    translator_lm = build_lm(500)
+
     lm_config.set_question_answering_lm(question_answering_lm)
     lm_config.set_discourse_manage_lm(discourse_manage_lm)
     lm_config.set_utterance_polishing_lm(utterance_polishing_lm)
@@ -155,9 +244,16 @@ def main(args):
     lm_config.set_question_asking_lm(question_asking_lm)
     lm_config.set_knowledge_base_lm(knowledge_base_lm)
 
-    topic = input("Topic: ")
+    topic_raw = input("Topic: ")
+    user_lang = detect_language(topic_raw)
+    topic = (
+        translate_text(translator_lm, topic_raw, target_lang="en", source_lang_hint="ko")
+        if user_lang == "ko"
+        else topic_raw
+    )
     runner_argument = RunnerArgument(
         topic=topic,
+        language=user_lang,
         retrieve_top_k=args.retrieve_top_k,
         max_search_queries=args.max_search_queries,
         total_conv_turn=args.total_conv_turn,
@@ -244,15 +340,29 @@ def main(args):
         # observing Co-STORM LLM agent utterance for 5 turns
         for _ in range(1):
             conv_turn = costorm_runner.step()
-            print(f"**{conv_turn.role}**: {conv_turn.utterance}\n")
+            utter_to_show = (
+                translate_text(translator_lm, conv_turn.utterance, target_lang="ko")
+                if user_lang == "ko"
+                else conv_turn.utterance
+            )
+            print(f"**{conv_turn.role}**: {utter_to_show}\n")
 
         # active engaging by injecting your utterance
         your_utterance = input("Your utterance: ")
+        if user_lang == "ko":
+            your_utterance = translate_text(
+                translator_lm, your_utterance, target_lang="en", source_lang_hint="ko"
+            )
         costorm_runner.step(user_utterance=your_utterance)
 
         # continue observing
         conv_turn = costorm_runner.step()
-        print(f"**{conv_turn.role}**: {conv_turn.utterance}\n")
+        utter_to_show = (
+            translate_text(translator_lm, conv_turn.utterance, target_lang="ko")
+            if user_lang == "ko"
+            else conv_turn.utterance
+        )
+        print(f"**{conv_turn.role}**: {utter_to_show}\n")
 
         # generate report
         costorm_runner.knowledge_base.reorganize()
@@ -276,14 +386,26 @@ def main(args):
 
         # Save artifacts if available
         if article is not None:
-            with open(os.path.join(args.output_dir, "report.md"), "w") as f:
-                f.write(article)
+            # If the pipeline ran in Korean, the generated article is already Korean.
+            if user_lang == "ko":
+                article_kr = article
+                with open(os.path.join(args.output_dir, "report_kr.md"), "w") as f:
+                    f.write(article_kr)
+            else:
+                # Default: English generation
+                with open(os.path.join(args.output_dir, "report_eng.md"), "w") as f:
+                    f.write(article)
 
         if instance_copy is not None:
             with open(os.path.join(args.output_dir, "instance_dump.json"), "w") as f:
                 json.dump(instance_copy, f, indent=2)
 
         if log_dump is not None:
+            # Attach run configuration to help post-run analysis (including language).
+            try:
+                log_dump["runner_argument"] = runner_argument.to_dict()
+            except Exception:
+                pass
             with open(os.path.join(args.output_dir, "log.json"), "w") as f:
                 json.dump(log_dump, f, indent=2)
 

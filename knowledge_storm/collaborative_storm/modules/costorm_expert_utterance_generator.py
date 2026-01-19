@@ -146,7 +146,7 @@ class CoStormExpertUtteranceGenerationModule(dspy.Module):
                     topic=topic,
                     question=action_content,
                     mode="brief",
-                    style="conversational and concise",
+                    style="formal and concise with inline citations",
                     callback_handler=self.callback_handler,
                 )
             conversation_turn.claim_to_make = action_content

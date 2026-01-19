@@ -14,7 +14,8 @@ from ...interface import Information
 
 
 class QuestionToQuery(dspy.Signature):
-    """You want to answer the question or support a claim using Google search. What do you type in the search box?
+    """You want to answer the question or support a claim using a web search engine.
+    Always output English search queries even if the topic/question is in another language.
     The question is raised in a round table discussion on a topic. The question may or may not focus on the topic itself.
     Write the queries you will use in the following format:
     - query 1
@@ -31,7 +32,7 @@ class QuestionToQuery(dspy.Signature):
 
 class AnswerQuestion(dspy.Signature):
     """You are an expert who can use information effectively. You have gathered the related information and will now use the information to form a response.
-    Make your response as informative as possible and make sure every sentence is supported by the gathered information.
+    Respond strictly in English, make the answer as informative as possible, and make sure every sentence is supported by the gathered information.
     If [Gathered information] is not directly related to the [Topic] and [Question], provide the most relevant answer you can based on the available information, and explain any limitations or gaps.
     Use [1], [2], ..., [n] in line (for example, "The capital of the United States is Washington, D.C.[1][3].").
     You DO NOT need to include a References or Sources section to list the sources at the end. The style of writing should be formal.
@@ -42,7 +43,7 @@ class AnswerQuestion(dspy.Signature):
     info = dspy.InputField(prefix="Gathered information:\n", format=str)
     style = dspy.InputField(prefix="Style of your response should be:", format=str)
     answer = dspy.OutputField(
-        prefix="Now give your response. (Try to use as many different sources as possible and do not hallucinate.)",
+        prefix="Now give your response in English. (Use citations [1], [2], ... and avoid hallucination.)",
         format=str,
     )
 
@@ -76,14 +77,24 @@ class AnswerQuestionModule(dspy.Module):
                 for q in queries.split("\n")
             ]
             queries = queries[: self.max_search_queries]
+            # Drop empty queries to avoid invalid search requests; fall back to the question text if all were filtered out.
+            queries = [q for q in queries if q]
+            if not queries and question:
+                queries = [question.strip()]
         self.logging_wrapper.add_query_count(count=len(queries))
         with self.logging_wrapper.log_event(
             f"AnswerQuestionModule.retriever.retrieve ({hash(question)})"
         ):
             # retrieve information using retriever
-            searched_results: List[Information] = self.retriever.retrieve(
-                list(set(queries)), exclude_urls=[]
-            )
+            try:
+                searched_results: List[Information] = self.retriever.retrieve(
+                    list(dict.fromkeys(queries)), exclude_urls=[]
+                )
+            except Exception as exc:
+                print(
+                    f"Retrieval failed for question '{question}' with queries {queries}: {exc}"
+                )
+                searched_results = []
         # update storm information meta to include the question
         for storm_info in searched_results:
             storm_info.meta["question"] = question

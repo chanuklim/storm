@@ -167,7 +167,10 @@ class WarmStartConversation(dspy.Module):
     def get_background_info(self, topic: str):
         question = f"Background information about {topic}"
         answer = self.answer_question_module(
-            topic=topic, question=question, mode="extensive", style="conversational"
+            topic=topic,
+            question=question,
+            mode="extensive",
+            style="formal and concise with inline citations",
         )
 
         return ConversationTurn(
@@ -212,7 +215,7 @@ class WarmStartConversation(dspy.Module):
                             topic=topic,
                             question=question,
                             mode="brief",
-                            style="conversational",
+                            style="formal and concise with inline citations",
                         )
                         conversation_turn = ConversationTurn(
                             role=expert,

@@ -346,7 +346,7 @@ class PureRAGAgent(Agent):
             topic=self.topic,
             question=question,
             mode="brief",
-            style="conversational and concise",
+            style="formal and concise with inline citations",
         )
         conversation_turn = ConversationTurn(
             role=self.role_name, raw_utterance="", utterance_type="Potential Answer"
